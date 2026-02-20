@@ -1457,7 +1457,11 @@ pub async fn run(
     let pgvector_rag: Option<(PgVectorRagStore, EmbeddingClient, usize)> = if config.rag.enabled {
         let provider = config.storage.provider.config.provider.trim();
         let db_url = config.storage.provider.config.db_url.as_deref();
-        let api_key = config.rag.embedding_api_key.as_deref();
+        let api_key = config
+            .rag
+            .embedding_api_key
+            .as_deref()
+            .or(config.api_key.as_deref());
 
         match (provider, db_url, api_key) {
             ("postgres", Some(db_url), Some(api_key)) => {
@@ -1485,7 +1489,7 @@ pub async fn run(
             }
             _ => {
                 tracing::warn!(
-                    "RAG is enabled but requires postgres storage provider, db_url, and rag.embedding_api_key"
+                    "RAG is enabled but requires postgres storage provider, db_url, and embedding API key"
                 );
                 None
             }
@@ -1934,7 +1938,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let pgvector_rag: Option<(PgVectorRagStore, EmbeddingClient, usize)> = if config.rag.enabled {
         let provider = config.storage.provider.config.provider.trim();
         let db_url = config.storage.provider.config.db_url.as_deref();
-        let api_key = config.rag.embedding_api_key.as_deref();
+        let api_key = config
+            .rag
+            .embedding_api_key
+            .as_deref()
+            .or(config.api_key.as_deref());
 
         match (provider, db_url, api_key) {
             ("postgres", Some(db_url), Some(api_key)) => {
@@ -1962,7 +1970,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             }
             _ => {
                 tracing::warn!(
-                    "RAG is enabled but requires postgres storage provider, db_url, and rag.embedding_api_key"
+                    "RAG is enabled but requires postgres storage provider, db_url, and embedding API key"
                 );
                 None
             }
