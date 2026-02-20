@@ -5,6 +5,8 @@ FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c8474
 
 WORKDIR /app
 
+ARG CARGO_BUILD_JOBS
+
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -23,7 +25,8 @@ RUN mkdir -p src benches crates/robot-kit/src \
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked
+    JOBS="${CARGO_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)}" && \
+    cargo build --release --locked -j "${JOBS}"
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
@@ -34,7 +37,8 @@ COPY firmware/ firmware/
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked && \
+    JOBS="${CARGO_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)}" && \
+    cargo build --release --locked -j "${JOBS}" && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 

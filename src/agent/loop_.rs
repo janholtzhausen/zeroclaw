@@ -6,6 +6,7 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
+use crate::rag::pgvector::{format_retrieval_context, EmbeddingClient, PgVectorRagStore};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -285,6 +286,23 @@ fn build_hardware_context(
     }
     context.push('\n');
     context
+}
+
+async fn build_pgvector_context(
+    pgvector_rag: &Option<(PgVectorRagStore, EmbeddingClient, usize)>,
+    user_msg: &str,
+) -> String {
+    let Some((store, embedder, top_k)) = pgvector_rag else {
+        return String::new();
+    };
+
+    match store.retrieve(embedder, user_msg, *top_k, None, true).await {
+        Ok(results) => format_retrieval_context(&results),
+        Err(error) => {
+            tracing::warn!(?error, "PGVector RAG retrieval failed");
+            String::new()
+        }
+    }
 }
 
 /// Find a tool by name in the registry.
@@ -1436,6 +1454,50 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
+    let pgvector_rag: Option<(PgVectorRagStore, EmbeddingClient, usize)> = if config.rag.enabled {
+        let provider = config.storage.provider.config.provider.trim();
+        let db_url = config.storage.provider.config.db_url.as_deref();
+        let api_key = config
+            .rag
+            .embedding_api_key
+            .as_deref()
+            .or(config.api_key.as_deref());
+
+        match (provider, db_url, api_key) {
+            ("postgres", Some(db_url), Some(api_key)) => {
+                let top_k = if config.rag.retrieval_top_k == 0 {
+                    5
+                } else {
+                    config.rag.retrieval_top_k
+                };
+
+                match PgVectorRagStore::new(
+                    db_url,
+                    &config.storage.provider.config.schema,
+                    config.rag.similarity_threshold,
+                ) {
+                    Ok(store) => Some((
+                        store,
+                        EmbeddingClient::new(api_key, &config.rag.embedding_model),
+                        top_k,
+                    )),
+                    Err(error) => {
+                        tracing::warn!(?error, "Failed to initialize PGVector RAG store");
+                        None
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "RAG is enabled but requires postgres storage provider, db_url, and embedding API key"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -1563,6 +1625,12 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    if pgvector_rag.is_some() {
+        system_prompt.push_str(
+            "\n[RAG policy]\nWhen <context> retrieval data is present, prioritize it over generic prior knowledge and cite source section/path in your answer by default.\n",
+        );
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
 
@@ -1588,7 +1656,8 @@ pub async fn run(
             .as_ref()
             .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let rag_context = build_pgvector_context(&pgvector_rag, &msg).await;
+        let context = format!("{rag_context}{mem_context}{hw_context}");
         let enriched = if context.is_empty() {
             msg.clone()
         } else {
@@ -1710,7 +1779,8 @@ pub async fn run(
                 .as_ref()
                 .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
                 .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
+            let rag_context = build_pgvector_context(&pgvector_rag, &user_input).await;
+            let context = format!("{rag_context}{mem_context}{hw_context}");
             let enriched = if context.is_empty() {
                 user_input.clone()
             } else {
@@ -1865,6 +1935,50 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .map(|b| b.board.clone())
         .collect();
 
+    let pgvector_rag: Option<(PgVectorRagStore, EmbeddingClient, usize)> = if config.rag.enabled {
+        let provider = config.storage.provider.config.provider.trim();
+        let db_url = config.storage.provider.config.db_url.as_deref();
+        let api_key = config
+            .rag
+            .embedding_api_key
+            .as_deref()
+            .or(config.api_key.as_deref());
+
+        match (provider, db_url, api_key) {
+            ("postgres", Some(db_url), Some(api_key)) => {
+                let top_k = if config.rag.retrieval_top_k == 0 {
+                    5
+                } else {
+                    config.rag.retrieval_top_k
+                };
+
+                match PgVectorRagStore::new(
+                    db_url,
+                    &config.storage.provider.config.schema,
+                    config.rag.similarity_threshold,
+                ) {
+                    Ok(store) => Some((
+                        store,
+                        EmbeddingClient::new(api_key, &config.rag.embedding_model),
+                        top_k,
+                    )),
+                    Err(error) => {
+                        tracing::warn!(?error, "Failed to initialize PGVector RAG store");
+                        None
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "RAG is enabled but requires postgres storage provider, db_url, and embedding API key"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
@@ -1928,13 +2042,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    if pgvector_rag.is_some() {
+        system_prompt.push_str(
+            "\n[RAG policy]\nWhen <context> retrieval data is present, prioritize it over generic prior knowledge and cite source section/path in your answer by default.\n",
+        );
+    }
+
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
         .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
         .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
+    let rag_context = build_pgvector_context(&pgvector_rag, message).await;
+    let context = format!("{rag_context}{mem_context}{hw_context}");
     let enriched = if context.is_empty() {
         message.to_string()
     } else {
