@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::rag::pgvector::{EmbeddingClient, IngestMetadata, PgVectorRagStore};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -12,6 +13,69 @@ pub struct HttpRequestTool {
     allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    rag_pipeline: Option<RagIngestPipeline>,
+}
+
+#[derive(Clone)]
+pub struct RagIngestPipeline {
+    store: PgVectorRagStore,
+    embedder: EmbeddingClient,
+    chunk_size_tokens: usize,
+    chunk_overlap_tokens: usize,
+}
+
+impl RagIngestPipeline {
+    pub fn new(
+        db_url: &str,
+        schema: &str,
+        embedding_api_key: &str,
+        embedding_model: &str,
+        similarity_threshold: f64,
+        chunk_size_tokens: usize,
+        chunk_overlap_tokens: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            store: PgVectorRagStore::new(db_url, schema, similarity_threshold)?,
+            embedder: EmbeddingClient::new(embedding_api_key, embedding_model),
+            chunk_size_tokens,
+            chunk_overlap_tokens,
+        })
+    }
+
+    async fn ingest_http_payload(
+        &self,
+        url: &str,
+        method: &str,
+        status_code: u16,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<bool> {
+        if body.trim().is_empty() {
+            return Ok(false);
+        }
+
+        let metadata_json = serde_json::json!({
+            "http_method": method,
+            "status_code": status_code,
+            "content_type": content_type.unwrap_or(""),
+        })
+        .to_string();
+
+        self.store
+            .ingest(
+                &self.embedder,
+                body,
+                self.chunk_size_tokens,
+                self.chunk_overlap_tokens,
+                &IngestMetadata {
+                    source_url: Some(url.to_string()),
+                    title: extract_title(body),
+                    source_type: "web".to_string(),
+                    metadata_json: Some(metadata_json),
+                },
+            )
+            .await
+    }
 }
 
 impl HttpRequestTool {
@@ -26,6 +90,23 @@ impl HttpRequestTool {
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
+            rag_pipeline: None,
+        }
+    }
+
+    pub fn with_rag(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        max_response_size: usize,
+        timeout_secs: u64,
+        rag_pipeline: Option<RagIngestPipeline>,
+    ) -> Self {
+        Self {
+            security,
+            allowed_domains: normalize_allowed_domains(allowed_domains),
+            max_response_size,
+            timeout_secs,
+            rag_pipeline,
         }
     }
 
@@ -243,6 +324,11 @@ impl Tool for HttpRequestTool {
             Ok(response) => {
                 let status = response.status();
                 let status_code = status.as_u16();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
 
                 // Get response headers (redact sensitive ones)
                 let response_headers = response.headers().iter();
@@ -260,16 +346,35 @@ impl Tool for HttpRequestTool {
 
                 // Get response body with size limit
                 let response_text = match response.text().await {
-                    Ok(text) => self.truncate_response(&text),
+                    Ok(text) => text,
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
+
+                if status.is_success()
+                    && should_ingest_content(content_type.as_deref(), &response_text)
+                {
+                    if let Some(rag_pipeline) = &self.rag_pipeline {
+                        if let Err(error) = rag_pipeline
+                            .ingest_http_payload(
+                                &url,
+                                method_str,
+                                status_code,
+                                content_type.as_deref(),
+                                &response_text,
+                            )
+                            .await
+                        {
+                            tracing::warn!(?error, "Failed to ingest HTTP response into RAG");
+                        }
+                    }
+                }
 
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
                     status.canonical_reason().unwrap_or("Unknown"),
                     headers_text,
-                    response_text
+                    self.truncate_response(&response_text)
                 );
 
                 Ok(ToolResult {
@@ -432,6 +537,34 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
         || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+}
+
+fn should_ingest_content(content_type: Option<&str>, body: &str) -> bool {
+    if body.trim().is_empty() {
+        return false;
+    }
+
+    match content_type.map(|value| value.to_lowercase()) {
+        Some(ct) => {
+            ct.starts_with("text/")
+                || ct.contains("json")
+                || ct.contains("xml")
+                || ct.contains("javascript")
+        }
+        None => true,
+    }
+}
+
+fn extract_title(body: &str) -> Option<String> {
+    let lower = body.to_lowercase();
+    let start = lower.find("<title>")? + 7;
+    let end = lower[start..].find("</title>")? + start;
+    let title = body[start..end].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
 }
 
 #[cfg(test)]
