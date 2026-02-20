@@ -171,28 +171,13 @@ pub struct PgVectorRagStore {
 
 impl PgVectorRagStore {
     pub fn new(db_url: &str, schema: &str, similarity_threshold: f64) -> Result<Self> {
+        let mut client = db_url
+            .parse::<postgres::Config>()
+            .context("invalid PostgreSQL connection URL")?
+            .connect(NoTls)
+            .context("failed to connect PostgreSQL for RAG")?;
+
         let schema_ident = format!("\"{}\"", schema);
-        let client = tokio::task::block_in_place(|| -> Result<Client> {
-            let config: postgres::Config = db_url
-                .parse()
-                .context("invalid PostgreSQL connection URL")?;
-
-            let mut client = config
-                .connect(NoTls)
-                .context("failed to connect PostgreSQL for RAG")?;
-
-            Self::init_schema(&mut client, &schema_ident)?;
-            Ok(client)
-        })?;
-
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            schema: schema.to_string(),
-            similarity_threshold,
-        })
-    }
-
-    fn init_schema(client: &mut Client, schema_ident: &str) -> Result<()> {
         client
             .batch_execute(&format!(
                 "
@@ -234,7 +219,11 @@ impl PgVectorRagStore {
             ))
             .context("failed to initialize pgvector RAG schema")?;
 
-        Ok(())
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            schema: schema.to_string(),
+            similarity_threshold,
+        })
     }
 
     pub async fn ingest(
