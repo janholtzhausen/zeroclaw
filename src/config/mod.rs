@@ -10,7 +10,7 @@ pub use schema::{
     HardwareConfig, HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
     IdentityConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
     ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope,
-    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
+    QueryClassificationConfig, RagConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
     SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig,
     SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
     TelegramConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
