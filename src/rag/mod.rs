@@ -10,6 +10,8 @@ use crate::memory::chunker;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub mod pgvector;
+
 /// A chunk of datasheet content with board metadata.
 #[derive(Debug, Clone)]
 pub struct DatasheetChunk {
