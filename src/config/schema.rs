@@ -178,6 +178,10 @@ pub struct Config {
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
 
+    /// Retrieval-augmented generation configuration (`[rag]`).
+    #[serde(default)]
+    pub rag: RagConfig,
+
     /// Delegate agent configurations for multi-agent workflows.
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
@@ -630,6 +634,66 @@ impl Default for PeripheralBoardConfig {
             transport: default_peripheral_transport(),
             path: None,
             baud: default_peripheral_baud(),
+        }
+    }
+}
+
+/// Retrieval-augmented generation configuration (`[rag]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RagConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_rag_embedding_provider")]
+    pub embedding_provider: String,
+    #[serde(default = "default_rag_embedding_model")]
+    pub embedding_model: String,
+    #[serde(default)]
+    pub embedding_api_key: Option<String>,
+    #[serde(default = "default_rag_chunk_size_tokens")]
+    pub chunk_size_tokens: usize,
+    #[serde(default = "default_rag_chunk_overlap_tokens")]
+    pub chunk_overlap_tokens: usize,
+    #[serde(default = "default_rag_retrieval_top_k")]
+    pub retrieval_top_k: usize,
+    #[serde(default = "default_rag_similarity_threshold")]
+    pub similarity_threshold: f64,
+}
+
+fn default_rag_embedding_provider() -> String {
+    "nvidia".into()
+}
+
+fn default_rag_embedding_model() -> String {
+    "nvidia/nv-embedqa-e5-v5".into()
+}
+
+fn default_rag_chunk_size_tokens() -> usize {
+    500
+}
+
+fn default_rag_chunk_overlap_tokens() -> usize {
+    50
+}
+
+fn default_rag_retrieval_top_k() -> usize {
+    5
+}
+
+fn default_rag_similarity_threshold() -> f64 {
+    0.3
+}
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            embedding_provider: default_rag_embedding_provider(),
+            embedding_model: default_rag_embedding_model(),
+            embedding_api_key: None,
+            chunk_size_tokens: default_rag_chunk_size_tokens(),
+            chunk_overlap_tokens: default_rag_chunk_overlap_tokens(),
+            retrieval_top_k: default_rag_retrieval_top_k(),
+            similarity_threshold: default_rag_similarity_threshold(),
         }
     }
 }
@@ -2801,6 +2865,7 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            rag: RagConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
@@ -3858,6 +3923,7 @@ default_temperature = 0.7
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            rag: RagConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
@@ -4027,6 +4093,7 @@ tool_dispatcher = "xml"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
+            rag: RagConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };

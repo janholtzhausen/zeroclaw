@@ -120,6 +120,43 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+fn build_http_rag_pipeline(root_config: &Config) -> Option<http_request::RagIngestPipeline> {
+    if !root_config.rag.enabled {
+        return None;
+    }
+
+    let provider = root_config.storage.provider.config.provider.trim();
+    let db_url = root_config.storage.provider.config.db_url.as_deref();
+    let embedding_api_key = root_config.rag.embedding_api_key.as_deref();
+
+    if provider != "postgres" {
+        return None;
+    }
+
+    let (Some(db_url), Some(embedding_api_key)) = (db_url, embedding_api_key) else {
+        tracing::warn!(
+            "HTTP RAG ingestion is enabled but requires postgres db_url and rag.embedding_api_key"
+        );
+        return None;
+    };
+
+    match http_request::RagIngestPipeline::new(
+        db_url,
+        &root_config.storage.provider.config.schema,
+        embedding_api_key,
+        &root_config.rag.embedding_model,
+        root_config.rag.similarity_threshold,
+        root_config.rag.chunk_size_tokens,
+        root_config.rag.chunk_overlap_tokens,
+    ) {
+        Ok(pipeline) => Some(pipeline),
+        Err(error) => {
+            tracing::warn!(?error, "Failed to initialize HTTP RAG ingestion pipeline");
+            None
+        }
+    }
+}
+
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -237,11 +274,13 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
+        let rag_pipeline = build_http_rag_pipeline(root_config);
+        tool_arcs.push(Arc::new(HttpRequestTool::with_rag(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
+            rag_pipeline,
         )));
     }
 
