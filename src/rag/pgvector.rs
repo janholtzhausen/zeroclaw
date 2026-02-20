@@ -171,41 +171,13 @@ pub struct PgVectorRagStore {
 
 impl PgVectorRagStore {
     pub fn new(db_url: &str, schema: &str, similarity_threshold: f64) -> Result<Self> {
+        let mut client = db_url
+            .parse::<postgres::Config>()
+            .context("invalid PostgreSQL connection URL")?
+            .connect(NoTls)
+            .context("failed to connect PostgreSQL for RAG")?;
+
         let schema_ident = format!("\"{}\"", schema);
-        let client = Self::initialize_client(db_url.to_string(), schema_ident)?;
-
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            schema: schema.to_string(),
-            similarity_threshold,
-        })
-    }
-
-    fn initialize_client(db_url: String, schema_ident: String) -> Result<Client> {
-        let init_handle = std::thread::Builder::new()
-            .name("pgvector-rag-init".to_string())
-            .spawn(move || -> Result<Client> {
-                let config: postgres::Config = db_url
-                    .parse()
-                    .context("invalid PostgreSQL connection URL")?;
-
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect PostgreSQL for RAG")?;
-
-                Self::init_schema(&mut client, &schema_ident)?;
-                Ok(client)
-            })
-            .context("failed to spawn PostgreSQL RAG initializer thread")?;
-
-        let init_result = init_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL RAG initializer thread panicked"))?;
-
-        init_result
-    }
-
-    fn init_schema(client: &mut Client, schema_ident: &str) -> Result<()> {
         client
             .batch_execute(&format!(
                 "
@@ -247,7 +219,11 @@ impl PgVectorRagStore {
             ))
             .context("failed to initialize pgvector RAG schema")?;
 
-        Ok(())
+        Ok(Self {
+            client: Arc::new(Mutex::new(client)),
+            schema: schema.to_string(),
+            similarity_threshold,
+        })
     }
 
     pub async fn ingest(

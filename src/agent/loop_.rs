@@ -1457,10 +1457,14 @@ pub async fn run(
     let pgvector_rag: Option<(PgVectorRagStore, EmbeddingClient, usize)> = if config.rag.enabled {
         let provider = config.storage.provider.config.provider.trim();
         let db_url = config.storage.provider.config.db_url.as_deref();
-        let api_key = config.rag.embedding_api_key.as_deref();
+        let api_key = config
+            .rag
+            .embedding_api_key
+            .as_deref()
+            .or(config.api_key.as_deref());
 
-        match (provider, db_url) {
-            ("postgres", Some(db_url)) => {
+        match (provider, db_url, api_key) {
+            ("postgres", Some(db_url), Some(api_key)) => {
                 let top_k = if config.rag.retrieval_top_k == 0 {
                     5
                 } else {
@@ -1472,20 +1476,11 @@ pub async fn run(
                     &config.storage.provider.config.schema,
                     config.rag.similarity_threshold,
                 ) {
-                    Ok(store) => {
-                        if let Some(api_key) = api_key {
-                            Some((
-                                store,
-                                EmbeddingClient::new(api_key, &config.rag.embedding_model),
-                                top_k,
-                            ))
-                        } else {
-                            tracing::warn!(
-                                "RAG tables initialized, but rag.embedding_api_key is missing; retrieval is disabled"
-                            );
-                            None
-                        }
-                    }
+                    Ok(store) => Some((
+                        store,
+                        EmbeddingClient::new(api_key, &config.rag.embedding_model),
+                        top_k,
+                    )),
                     Err(error) => {
                         tracing::warn!(?error, "Failed to initialize PGVector RAG store");
                         None
@@ -1493,7 +1488,9 @@ pub async fn run(
                 }
             }
             _ => {
-                tracing::warn!("RAG is enabled but requires postgres storage provider and db_url");
+                tracing::warn!(
+                    "RAG is enabled but requires postgres storage provider, db_url, and embedding API key"
+                );
                 None
             }
         }
@@ -1941,10 +1938,14 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let pgvector_rag: Option<(PgVectorRagStore, EmbeddingClient, usize)> = if config.rag.enabled {
         let provider = config.storage.provider.config.provider.trim();
         let db_url = config.storage.provider.config.db_url.as_deref();
-        let api_key = config.rag.embedding_api_key.as_deref();
+        let api_key = config
+            .rag
+            .embedding_api_key
+            .as_deref()
+            .or(config.api_key.as_deref());
 
-        match (provider, db_url) {
-            ("postgres", Some(db_url)) => {
+        match (provider, db_url, api_key) {
+            ("postgres", Some(db_url), Some(api_key)) => {
                 let top_k = if config.rag.retrieval_top_k == 0 {
                     5
                 } else {
@@ -1956,20 +1957,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
                     &config.storage.provider.config.schema,
                     config.rag.similarity_threshold,
                 ) {
-                    Ok(store) => {
-                        if let Some(api_key) = api_key {
-                            Some((
-                                store,
-                                EmbeddingClient::new(api_key, &config.rag.embedding_model),
-                                top_k,
-                            ))
-                        } else {
-                            tracing::warn!(
-                                "RAG tables initialized, but rag.embedding_api_key is missing; retrieval is disabled"
-                            );
-                            None
-                        }
-                    }
+                    Ok(store) => Some((
+                        store,
+                        EmbeddingClient::new(api_key, &config.rag.embedding_model),
+                        top_k,
+                    )),
                     Err(error) => {
                         tracing::warn!(?error, "Failed to initialize PGVector RAG store");
                         None
@@ -1977,7 +1969,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
                 }
             }
             _ => {
-                tracing::warn!("RAG is enabled but requires postgres storage provider and db_url");
+                tracing::warn!(
+                    "RAG is enabled but requires postgres storage provider, db_url, and embedding API key"
+                );
                 None
             }
         }
