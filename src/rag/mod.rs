@@ -6,6 +6,23 @@
 //! - Pin/alias tables (e.g. `red_led: 13`) for explicit lookup
 //! - Keyword retrieval (default) or semantic search via embeddings (optional)
 
+pub mod db;
+pub mod pgvector;
+
+/// Ensure RAG pgvector schema exists when enabled.
+pub async fn ensure_rag_schema(enabled: bool, db_url: &str) -> anyhow::Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+
+    if db_url.trim().is_empty() {
+        anyhow::bail!("rag.enabled=true requires a non-empty storage.provider.config.db_url");
+    }
+
+    let _pool = db::init_pool_and_migrate(db_url).await?;
+    Ok(())
+}
+
 use crate::memory::chunker;
 use std::collections::HashMap;
 use std::path::Path;
