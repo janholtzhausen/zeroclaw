@@ -581,6 +581,19 @@ pub async fn run(
     }
     effective_config.default_temperature = temperature;
 
+    if effective_config.rag.enabled {
+        let db_url = effective_config
+            .storage
+            .provider
+            .config
+            .db_url
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("rag.enabled=true requires storage.provider.config.db_url")
+            })?;
+        crate::rag::ensure_rag_schema(effective_config.rag.enabled, db_url).await?;
+    }
+
     let mut agent = Agent::from_config(&effective_config)?;
 
     let provider_name = effective_config

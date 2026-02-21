@@ -126,6 +126,8 @@ impl PgVectorRagStore {
     }
 
     pub async fn ingest_web_content(&self, source_url: &str, body: &str) -> Result<()> {
+        use diesel::sql_types::{Integer, Text};
+
         let trimmed = body.trim();
         if trimmed.is_empty() {
             return Ok(());
@@ -138,6 +140,29 @@ impl PgVectorRagStore {
 
         let conn = self.pool.get().await?;
         conn.interact(move |conn| {
+            let source_id = Uuid::new_v4().to_string();
+            let chunk_id = Uuid::new_v4().to_string();
+
+            diesel::sql_query(
+                "INSERT INTO rag_sources (id, source_type, source_url, title, metadata) \
+                 VALUES ($1::uuid, 'web', $2, NULL, '{}'::jsonb)",
+            )
+            .bind::<Text, _>(&source_id)
+            .bind::<Text, _>(&source_url)
+            .execute(conn)?;
+
+            diesel::sql_query(
+                "INSERT INTO rag_chunks \
+                 (id, source_id, chunk_index, content, heading_context, embedding, token_count, metadata) \
+                 VALUES ($1::uuid, $2::uuid, $3, $4, NULL, $5::vector, NULL, '{}'::jsonb)",
+            )
+            .bind::<Text, _>(&chunk_id)
+            .bind::<Text, _>(&source_id)
+            .bind::<Integer, _>(0)
+            .bind::<Text, _>(&content)
+            .bind::<Text, _>(&embedding_sql)
+            .execute(conn)
+            .map(|_| ())
             let source_id = Uuid::new_v4();
             let source_id_str = source_id.to_string();
             let chunk_id = Uuid::new_v4().to_string();
@@ -158,10 +183,13 @@ impl PgVectorRagStore {
     }
 
     pub async fn retrieve_context(&self, query: &str, top_k: usize) -> Result<String> {
+        use diesel::sql_types::{Double, Integer, Nullable, Text};
+
         if query.trim().is_empty() || top_k == 0 {
             return Ok(String::new());
         }
 
+        let limit = i32::try_from(top_k).context("retrieval top_k exceeds i32")?;
         let embedding = self.embedding.embed(query, "query").await?;
         let embedding_sql = vector_to_sql(&embedding);
         let threshold = self.similarity_threshold;
@@ -183,6 +211,19 @@ impl PgVectorRagStore {
                     similarity: f64,
                 }
 
+                let results = diesel::sql_query(
+                    "SELECT c.content, c.heading_context, s.source_url, \
+                     1 - (c.embedding <=> $1::vector) AS similarity \
+                     FROM rag_chunks c \
+                     INNER JOIN rag_sources s ON s.id = c.source_id \
+                     WHERE s.active = TRUE \
+                     ORDER BY c.embedding <=> $1::vector \
+                     LIMIT $2",
+                )
+                .bind::<Text, _>(&embedding_sql)
+                .bind::<Integer, _>(limit)
+                .load::<RagRow>(conn)
+                .context("failed to query rag_chunks")?;
                 let stmt = format!(
                     "SELECT c.content, c.heading_context, s.source_url, 1 - (c.embedding <=> '{embedding_sql}'::vector) AS similarity \
                      FROM rag_chunks c \
@@ -223,6 +264,7 @@ impl PgVectorRagStore {
 
         for (heading, url, content) in rows {
             context.push_str(&format!(
+                "[Source: {} > context]\n[URL: {}]\n<content>\n{}\n</content>\n\n",
                 "[Source: {}]\n[URL: {}]\n<content>\n{}\n</content>\n\n",
                 heading, url, content
             ));
