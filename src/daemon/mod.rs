@@ -17,6 +17,19 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    if config.rag.enabled {
+        let db_url = config
+            .storage
+            .provider
+            .config
+            .db_url
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("rag.enabled=true requires storage.provider.config.db_url")
+            })?;
+        crate::rag::ensure_rag_schema(config.rag.enabled, db_url).await?;
+    }
+
     if config.heartbeat.enabled {
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
