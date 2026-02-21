@@ -1,5 +1,6 @@
 use crate::rag::db;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use deadpool_diesel::postgres::Pool;
 use diesel::RunQueryDsl;
 use reqwest::Client;
@@ -72,9 +73,9 @@ impl EmbeddingClient {
             .next()
             .context("embedding API returned empty data")?;
 
-        if first.embedding.len() != 1024 {
+        if first.embedding.len() != 2048 {
             anyhow::bail!(
-                "embedding dimension mismatch: expected 1024, got {}",
+                "embedding dimension mismatch: expected 2048, got {}",
                 first.embedding.len()
             );
         }
@@ -90,7 +91,21 @@ pub struct PgVectorRagStore {
     similarity_threshold: f32,
 }
 
+#[async_trait]
+pub trait RagIngestStore: Send + Sync {
+    async fn ingest_web_document(&self, source_url: &str, body: &str) -> Result<()>;
+}
+
+#[async_trait]
+impl RagIngestStore for PgVectorRagStore {
+    async fn ingest_web_document(&self, source_url: &str, body: &str) -> Result<()> {
+        PgVectorRagStore::ingest_web_content(self, source_url, body).await
+    }
+}
+
 impl PgVectorRagStore {
+    const MAX_INGEST_TOKENS_PER_CHUNK: usize = 400;
+
     pub fn new_without_migrations(
         db_url: &str,
         embedding_api_key: &str,
@@ -133,15 +148,25 @@ impl PgVectorRagStore {
             return Ok(());
         }
 
-        let embedding = self.embedding.embed(trimmed, "passage").await?;
-        let embedding_sql = vector_to_sql(&embedding);
+        let chunks = split_into_word_chunks(trimmed, Self::MAX_INGEST_TOKENS_PER_CHUNK);
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let mut chunk_rows = Vec::with_capacity(chunks.len());
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let chunk_index =
+                i32::try_from(idx).context("chunk index exceeded i32 during RAG ingestion")?;
+            let embedding = self.embedding.embed(&chunk, "passage").await?;
+            let embedding_sql = vector_to_sql(&embedding);
+            chunk_rows.push((chunk_index, chunk, embedding_sql));
+        }
+
         let source_url = source_url.to_string();
-        let content = trimmed.to_string();
 
         let conn = self.pool.get().await?;
-        conn.interact(move |conn| {
+        conn.interact(move |conn| -> Result<()> {
             let source_id = Uuid::new_v4().to_string();
-            let chunk_id = Uuid::new_v4().to_string();
 
             diesel::sql_query(
                 "INSERT INTO rag_sources (id, source_type, source_url, title, metadata) \
@@ -151,18 +176,22 @@ impl PgVectorRagStore {
             .bind::<Text, _>(&source_url)
             .execute(conn)?;
 
-            diesel::sql_query(
-                "INSERT INTO rag_chunks \
-                 (id, source_id, chunk_index, content, heading_context, embedding, token_count, metadata) \
-                 VALUES ($1::uuid, $2::uuid, $3, $4, NULL, $5::vector, NULL, '{}'::jsonb)",
-            )
-            .bind::<Text, _>(&chunk_id)
-            .bind::<Text, _>(&source_id)
-            .bind::<Integer, _>(0)
-            .bind::<Text, _>(&content)
-            .bind::<Text, _>(&embedding_sql)
-            .execute(conn)
-            .map(|_| ())
+            for (chunk_index, content, embedding_sql) in chunk_rows {
+                let chunk_id = Uuid::new_v4().to_string();
+                diesel::sql_query(
+                    "INSERT INTO rag_chunks \
+                     (id, source_id, chunk_index, content, heading_context, embedding, token_count, metadata) \
+                     VALUES ($1::uuid, $2::uuid, $3, $4, NULL, $5::vector, NULL, '{}'::jsonb)",
+                )
+                .bind::<Text, _>(&chunk_id)
+                .bind::<Text, _>(&source_id)
+                .bind::<Integer, _>(chunk_index)
+                .bind::<Text, _>(&content)
+                .bind::<Text, _>(&embedding_sql)
+                .execute(conn)?;
+            }
+
+            Ok(())
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))??;
@@ -257,6 +286,36 @@ fn vector_to_sql(values: &[f32]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{inner}]")
+}
+
+fn split_into_word_chunks(text: &str, max_tokens: usize) -> Vec<String> {
+    if max_tokens == 0 {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_tokens = 0usize;
+
+    for word in text.split_whitespace() {
+        if current_tokens == max_tokens {
+            chunks.push(current);
+            current = String::new();
+            current_tokens = 0;
+        }
+
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        current_tokens += 1;
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 fn sql_escape(input: &str) -> String {

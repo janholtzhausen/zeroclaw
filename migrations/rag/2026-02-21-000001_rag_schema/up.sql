@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
     heading_context TEXT,
-    embedding vector(1024) NOT NULL,
+    embedding vector(2048) NOT NULL,
     token_count INTEGER,
     metadata JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
