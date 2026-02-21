@@ -1,5 +1,6 @@
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, RagConfig, StreamMode,
+    WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -185,6 +186,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        rag: RagConfig::default(),
         rag: crate::config::RagConfig::default(),
     };
 
@@ -429,6 +431,7 @@ async fn run_quick_setup_with_home(
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        rag: RagConfig::default(),
         rag: crate::config::RagConfig::default(),
     };
 

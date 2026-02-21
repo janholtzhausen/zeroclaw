@@ -171,7 +171,7 @@ impl PgVectorRagStore {
     }
 
     pub async fn retrieve_context(&self, query: &str, top_k: usize) -> Result<String> {
-        use diesel::sql_types::{Double, Integer, Nullable, Text};
+        use diesel::sql_types::Integer;
 
         if query.trim().is_empty() || top_k == 0 {
             return Ok(String::new());
@@ -212,19 +212,6 @@ impl PgVectorRagStore {
                 .bind::<Integer, _>(limit)
                 .load::<RagRow>(conn)
                 .context("failed to query rag_chunks")?;
-                let stmt = format!(
-                    "SELECT c.content, c.heading_context, s.source_url, 1 - (c.embedding <=> '{embedding_sql}'::vector) AS similarity \
-                     FROM rag_chunks c \
-                     INNER JOIN rag_sources s ON s.id = c.source_id \
-                     WHERE s.active = TRUE \
-                     ORDER BY c.embedding <=> '{embedding_sql}'::vector \
-                     LIMIT {}",
-                    top_k
-                );
-
-                let results = diesel::sql_query(stmt)
-                    .load::<RagRow>(conn)
-                    .context("failed to query rag_chunks")?;
 
                 let filtered = results
                     .into_iter()
