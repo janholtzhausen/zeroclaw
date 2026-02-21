@@ -163,21 +163,9 @@ impl PgVectorRagStore {
             .bind::<Text, _>(&embedding_sql)
             .execute(conn)
             .map(|_| ())
-            let source_id = Uuid::new_v4();
-            let source_id_str = source_id.to_string();
-            let chunk_id = Uuid::new_v4().to_string();
-            let escaped_url = sql_escape(&source_url);
-            let escaped_content = sql_escape(&content);
-            let stmt = format!(
-                "INSERT INTO rag_sources (id, source_type, source_url, title, metadata) \
-                 VALUES ('{source_id_str}', 'web', '{escaped_url}', NULL, '{{}}'::jsonb);\
-                 INSERT INTO rag_chunks \
-                 (id, source_id, chunk_index, content, heading_context, embedding, token_count, metadata) \
-                 VALUES ('{chunk_id}', '{source_id_str}', 0, '{escaped_content}', NULL, '{embedding_sql}'::vector, NULL, '{{}}'::jsonb);"
-            );
-            diesel::sql_query(stmt).execute(conn).map(|_| ())
         })
-        .await??;
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))??;
 
         Ok(())
     }
@@ -252,7 +240,8 @@ impl PgVectorRagStore {
 
                 Ok(filtered)
             })
-            .await??;
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))??;
 
         if rows.is_empty() {
             return Ok(String::new());
@@ -264,7 +253,6 @@ impl PgVectorRagStore {
 
         for (heading, url, content) in rows {
             context.push_str(&format!(
-                "[Source: {} > context]\n[URL: {}]\n<content>\n{}\n</content>\n\n",
                 "[Source: {}]\n[URL: {}]\n<content>\n{}\n</content>\n\n",
                 heading, url, content
             ));

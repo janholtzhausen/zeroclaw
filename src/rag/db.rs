@@ -3,7 +3,8 @@ use deadpool_diesel::postgres::{Manager, Pool};
 use deadpool_diesel::Runtime;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 
-pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/rag");
+pub const MIGRATIONS: EmbeddedMigrations =
+    embed_migrations!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/rag"));
 
 pub fn create_pool(db_url: &str) -> Result<Pool> {
     let manager = Manager::new(db_url.to_string(), Runtime::Tokio1);
@@ -14,7 +15,8 @@ pub fn create_pool(db_url: &str) -> Result<Pool> {
 pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
     conn.interact(|conn| conn.run_pending_migrations(MIGRATIONS).map(|_| ()))
-        .await??;
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))??;
     Ok(())
 }
 
