@@ -163,6 +163,19 @@ impl PgVectorRagStore {
             .bind::<Text, _>(&embedding_sql)
             .execute(conn)
             .map(|_| ())
+            let source_id = Uuid::new_v4();
+            let source_id_str = source_id.to_string();
+            let chunk_id = Uuid::new_v4().to_string();
+            let escaped_url = sql_escape(&source_url);
+            let escaped_content = sql_escape(&content);
+            let stmt = format!(
+                "INSERT INTO rag_sources (id, source_type, source_url, title, metadata) \
+                 VALUES ('{source_id_str}', 'web', '{escaped_url}', NULL, '{{}}'::jsonb);\
+                 INSERT INTO rag_chunks \
+                 (id, source_id, chunk_index, content, heading_context, embedding, token_count, metadata) \
+                 VALUES ('{chunk_id}', '{source_id_str}', 0, '{escaped_content}', NULL, '{embedding_sql}'::vector, NULL, '{{}}'::jsonb);"
+            );
+            diesel::sql_query(stmt).execute(conn).map(|_| ())
         })
         .await??;
 
@@ -184,6 +197,8 @@ impl PgVectorRagStore {
         let conn = self.pool.get().await?;
         let rows = conn
             .interact(move |conn| -> Result<Vec<(String, String, String)>> {
+                use diesel::sql_types::{Double, Nullable, Text};
+
                 #[derive(diesel::QueryableByName)]
                 struct RagRow {
                     #[diesel(sql_type = Text)]
@@ -209,6 +224,19 @@ impl PgVectorRagStore {
                 .bind::<Integer, _>(limit)
                 .load::<RagRow>(conn)
                 .context("failed to query rag_chunks")?;
+                let stmt = format!(
+                    "SELECT c.content, c.heading_context, s.source_url, 1 - (c.embedding <=> '{embedding_sql}'::vector) AS similarity \
+                     FROM rag_chunks c \
+                     INNER JOIN rag_sources s ON s.id = c.source_id \
+                     WHERE s.active = TRUE \
+                     ORDER BY c.embedding <=> '{embedding_sql}'::vector \
+                     LIMIT {}",
+                    top_k
+                );
+
+                let results = diesel::sql_query(stmt)
+                    .load::<RagRow>(conn)
+                    .context("failed to query rag_chunks")?;
 
                 let filtered = results
                     .into_iter()
@@ -237,6 +265,7 @@ impl PgVectorRagStore {
         for (heading, url, content) in rows {
             context.push_str(&format!(
                 "[Source: {} > context]\n[URL: {}]\n<content>\n{}\n</content>\n\n",
+                "[Source: {}]\n[URL: {}]\n<content>\n{}\n</content>\n\n",
                 heading, url, content
             ));
         }
@@ -253,6 +282,10 @@ fn vector_to_sql(values: &[f32]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{inner}]")
+}
+
+fn sql_escape(input: &str) -> String {
+    input.replace('"', "\"\"").replace('\'', "''")
 }
 
 #[cfg(test)]
