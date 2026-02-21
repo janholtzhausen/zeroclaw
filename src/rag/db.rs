@@ -4,7 +4,7 @@ use deadpool_diesel::Runtime;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 
 pub const MIGRATIONS: EmbeddedMigrations =
-    embed_migrations!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/rag"));
+    embed_migrations!("migrations/rag");
 
 pub fn create_pool(db_url: &str) -> Result<Pool> {
     let manager = Manager::new(db_url.to_string(), Runtime::Tokio1);
@@ -17,11 +17,7 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let migration_result = conn
         .interact(|conn| conn.run_pending_migrations(MIGRATIONS).map(|_| ()))
         .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
     migration_result.map_err(|e| anyhow::anyhow!("{e}"))?;
-    conn.interact(|conn| conn.run_pending_migrations(MIGRATIONS).map(|_| ()))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))??;
     Ok(())
 }
 

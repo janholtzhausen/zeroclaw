@@ -1,4 +1,5 @@
 pub mod schema;
+pub use schema::RagConfig;
 
 #[allow(unused_imports)]
 pub use schema::{
