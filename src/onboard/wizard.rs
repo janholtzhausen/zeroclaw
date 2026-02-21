@@ -185,6 +185,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        rag: crate::config::RagConfig::default(),
     };
 
     println!(
@@ -428,6 +429,7 @@ async fn run_quick_setup_with_home(
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        rag: crate::config::RagConfig::default(),
     };
 
     config.save().await?;
