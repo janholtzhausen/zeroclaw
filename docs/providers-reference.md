@@ -43,6 +43,7 @@ credential is not reused for fallback providers.
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | No | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
 | `bedrock` | `aws-bedrock` | No | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optional: `AWS_REGION`) |
 | `qianfan` | `baidu` | No | `QIANFAN_API_KEY` |
+| `doubao` | `volcengine`, `ark`, `doubao-cn` | No | `ARK_API_KEY`, `DOUBAO_API_KEY` |
 | `qwen` | `dashscope`, `qwen-intl`, `dashscope-intl`, `qwen-us`, `dashscope-us`, `qwen-code`, `qwen-oauth`, `qwen_oauth` | No | `QWEN_OAUTH_TOKEN`, `DASHSCOPE_API_KEY` |
 | `groq` | — | No | `GROQ_API_KEY` |
 | `mistral` | — | No | `MISTRAL_API_KEY` |
@@ -70,6 +71,14 @@ credential is not reused for fallback providers.
 - Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
 - After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
 - If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+
+### Ollama Cloud Routing Notes
+
+- Use `:cloud` model suffix only with a remote Ollama endpoint.
+- Remote endpoint should be set in `api_url` (example: `https://ollama.com`).
+- ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
+- If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
+- Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
 
 ### llama.cpp Server Notes
 

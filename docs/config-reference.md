@@ -134,6 +134,7 @@ Notes:
 |---|---|---|
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+| `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
 
 Notes:
 
@@ -141,7 +142,9 @@ Notes:
 - Environment overrides:
   - `ZEROCLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
   - `ZEROCLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
+  - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
+- `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 
 ## `[composio]`
 
@@ -391,6 +394,7 @@ Examples:
 - `[channels_config.telegram]`
 - `[channels_config.discord]`
 - `[channels_config.whatsapp]`
+- `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
 
 Notes:
@@ -434,6 +438,23 @@ Notes:
 
 - WhatsApp Web requires build flag `whatsapp-web`.
 - If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
+
+### `[channels_config.nextcloud_talk]`
+
+Native Nextcloud Talk bot integration (webhook receive + OCS send API).
+
+| Key | Required | Purpose |
+|---|---|---|
+| `base_url` | Yes | Nextcloud base URL (e.g. `https://cloud.example.com`) |
+| `app_token` | Yes | Bot app token used for OCS bearer auth |
+| `webhook_secret` | Optional | Enables webhook signature verification |
+| `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
+
+Notes:
+
+- Webhook endpoint is `POST /nextcloud-talk`.
+- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+- See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
 
 ## `[hardware]`
 

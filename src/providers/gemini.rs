@@ -316,11 +316,12 @@ impl GeminiProvider {
         let req = self.http_client().post(url).json(request);
         match auth {
             GeminiAuth::OAuthToken(token) => {
-                // cloudcode-pa expects an outer envelope with `request`.
+                // Internal Code Assist API uses a wrapped payload shape:
+                // { model, project?, user_prompt_id?, request: { contents, systemInstruction?, generationConfig } }
                 let internal_request = InternalGenerateContentEnvelope {
                     model: Self::format_internal_model_name(model),
-                    project: None,
-                    user_prompt_id: None,
+                    project: Self::resolve_oauth_project_id(),
+                    user_prompt_id: Some(uuid::Uuid::new_v4().to_string()),
                     request: InternalGenerateContentRequest {
                         contents: request.contents.clone(),
                         system_instruction: request.system_instruction.clone(),
@@ -334,6 +335,22 @@ impl GeminiProvider {
             }
             _ => req,
         }
+    }
+
+    fn resolve_oauth_project_id() -> Option<String> {
+        for key in [
+            "GEMINI_CODE_ASSIST_PROJECT",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_PROJECT_ID",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -748,9 +765,9 @@ mod tests {
     #[test]
     fn internal_request_includes_model() {
         let request = InternalGenerateContentEnvelope {
-            model: "gemini-test-model".to_string(),
+            model: "gemini-3-pro-preview".to_string(),
             project: None,
-            user_prompt_id: None,
+            user_prompt_id: Some("prompt-123".to_string()),
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
@@ -766,11 +783,14 @@ mod tests {
             },
         };
 
-        let json: serde_json::Value = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "gemini-test-model");
-        assert!(json.get("generationConfig").is_none());
-        assert!(json["request"].get("generationConfig").is_some());
-        assert_eq!(json["request"]["contents"][0]["role"], "user");
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"model\":\"gemini-3-pro-preview\""));
+        assert!(json.contains("\"request\""));
+        assert!(json.contains("\"generationConfig\""));
+        assert!(json.contains("\"maxOutputTokens\":8192"));
+        assert!(json.contains("\"user_prompt_id\":\"prompt-123\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"temperature\":0.7"));
     }
 
     #[test]

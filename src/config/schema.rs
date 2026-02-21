@@ -26,6 +26,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
+    "channel.nextcloud_talk",
     "channel.qq",
     "channel.signal",
     "channel.slack",
@@ -347,6 +348,25 @@ impl Default for AgentConfig {
 }
 
 /// Skills loading configuration (`[skills]` section).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillsPromptInjectionMode {
+    /// Inline full skill instructions and tool metadata into the system prompt.
+    #[default]
+    Full,
+    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    Compact,
+}
+
+fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjectionMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => Some(SkillsPromptInjectionMode::Full),
+        "compact" => Some(SkillsPromptInjectionMode::Compact),
+        _ => None,
+    }
+}
+
+/// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
@@ -357,6 +377,10 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Controls how skills are injected into the system prompt.
+    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    #[serde(default)]
+    pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
 impl Default for SkillsConfig {
@@ -364,6 +388,7 @@ impl Default for SkillsConfig {
         Self {
             open_skills_enabled: false,
             open_skills_dir: None,
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
     }
 }
@@ -2290,6 +2315,8 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
+    /// Nextcloud Talk bot channel configuration.
+    pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration.
@@ -2327,6 +2354,7 @@ impl Default for ChannelsConfig {
             signal: None,
             whatsapp: None,
             linq: None,
+            nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
@@ -2539,6 +2567,23 @@ pub struct LinqConfig {
     /// Allowed sender handles (phone numbers) or "*" for all
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+/// Nextcloud Talk bot configuration (webhook receive + OCS send API).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NextcloudTalkConfig {
+    /// Nextcloud base URL (e.g. "https://cloud.example.com").
+    pub base_url: String,
+    /// Bot app token used for OCS API bearer auth.
+    pub app_token: String,
+    /// Shared secret for webhook signature verification.
+    ///
+    /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 impl WhatsAppConfig {
@@ -3031,6 +3076,7 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigResolutionSource {
+    EnvConfigDir,
     EnvWorkspace,
     ActiveWorkspaceMarker,
     DefaultConfigDir,
@@ -3039,6 +3085,7 @@ enum ConfigResolutionSource {
 impl ConfigResolutionSource {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
             Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
@@ -3050,10 +3097,18 @@ async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_workspace_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
-    // Resolution priority:
-    // 1. ZEROCLAW_WORKSPACE env override
-    // 2. Persisted active workspace marker from onboarding/custom profile
-    // 3. Default ~/.zeroclaw layout
+    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let custom_config_dir = custom_config_dir.trim();
+        if !custom_config_dir.is_empty() {
+            let zeroclaw_dir = PathBuf::from(custom_config_dir);
+            return Ok((
+                zeroclaw_dir.clone(),
+                zeroclaw_dir.join("workspace"),
+                ConfigResolutionSource::EnvConfigDir,
+            ));
+        }
+    }
+
     if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
         if !custom_workspace.is_empty() {
             let (zeroclaw_dir, workspace_dir) =
@@ -3117,6 +3172,42 @@ fn encrypt_optional_secret(
     Ok(())
 }
 
+fn config_dir_creation_error(path: &Path) -> String {
+    format!(
+        "Failed to create config directory: {}. If running as an OpenRC service, \
+         ensure this path is writable by user 'zeroclaw'.",
+        path.display()
+    )
+}
+
+fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
+    let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
+    let config_key_present = config_api_key
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if config_key_present {
+        return true;
+    }
+
+    ["OLLAMA_API_KEY", "ZEROCLAW_API_KEY", "API_KEY"]
+        .iter()
+        .any(|name| {
+            std::env::var(name)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -3128,7 +3219,7 @@ impl Config {
 
         fs::create_dir_all(&zeroclaw_dir)
             .await
-            .context("Failed to create config directory")?;
+            .with_context(|| config_dir_creation_error(&zeroclaw_dir))?;
         fs::create_dir_all(&workspace_dir)
             .await
             .context("Failed to create workspace directory")?;
@@ -3273,6 +3364,29 @@ impl Config {
             }
         }
 
+        // Ollama cloud-routing safety checks
+        if self
+            .default_provider
+            .as_deref()
+            .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("ollama"))
+            && self
+                .default_model
+                .as_deref()
+                .is_some_and(|model| model.trim().ends_with(":cloud"))
+        {
+            if is_local_ollama_endpoint(self.api_url.as_deref()) {
+                anyhow::bail!(
+                    "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset. Set api_url to a remote Ollama endpoint (for example https://ollama.com)."
+                );
+            }
+
+            if !has_ollama_cloud_credential(self.api_key.as_deref()) {
+                anyhow::bail!(
+                    "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
+                );
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -3358,6 +3472,19 @@ impl Config {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
+            }
+        }
+
+        // Skills prompt mode override: ZEROCLAW_SKILLS_PROMPT_MODE
+        if let Ok(mode) = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE") {
+            if !mode.trim().is_empty() {
+                if let Some(parsed) = parse_skills_prompt_injection_mode(&mode) {
+                    self.skills.prompt_injection_mode = parsed;
+                } else {
+                    tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_SKILLS_PROMPT_MODE (valid: full|compact)"
+                    );
+                }
             }
         }
 
@@ -3701,8 +3828,20 @@ mod tests {
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
+        assert_eq!(
+            c.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn config_dir_creation_error_mentions_openrc_and_path() {
+        let msg = config_dir_creation_error(Path::new("/etc/zeroclaw"));
+        assert!(msg.contains("/etc/zeroclaw"));
+        assert!(msg.contains("OpenRC"));
+        assert!(msg.contains("zeroclaw"));
     }
 
     #[test]
@@ -3901,6 +4040,7 @@ default_temperature = 0.7
                 signal: None,
                 whatsapp: None,
                 linq: None,
+                nextcloud_talk: None,
                 email: None,
                 irc: None,
                 lark: None,
@@ -4446,6 +4586,7 @@ allowed_users = ["@ops:matrix.org"]
             signal: None,
             whatsapp: None,
             linq: None,
+            nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
@@ -4655,6 +4796,7 @@ channel_id = "C123"
                 allowed_numbers: vec!["+1".into()],
             }),
             linq: None,
+            nextcloud_talk: None,
             email: None,
             irc: None,
             lark: None,
@@ -4674,6 +4816,12 @@ channel_id = "C123"
     async fn channels_config_default_has_no_whatsapp() {
         let c = ChannelsConfig::default();
         assert!(c.whatsapp.is_none());
+    }
+
+    #[test]
+    async fn channels_config_default_has_no_nextcloud_talk() {
+        let c = ChannelsConfig::default();
+        assert!(c.nextcloud_talk.is_none());
     }
 
     // ══════════════════════════════════════════════════════════
@@ -5041,9 +5189,14 @@ default_temperature = 0.7
         let mut config = Config::default();
         assert!(!config.skills.open_skills_enabled);
         assert!(config.skills.open_skills_dir.is_none());
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -5051,9 +5204,14 @@ default_temperature = 0.7
             config.skills.open_skills_dir.as_deref(),
             Some("/tmp/open-skills")
         );
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
 
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -5061,12 +5219,19 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -5161,6 +5326,41 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn validate_ollama_cloud_model_requires_remote_api_url() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("ollama".to_string()),
+            default_model: Some("glm-5:cloud".to_string()),
+            api_url: None,
+            api_key: Some("ollama-key".to_string()),
+            ..Config::default()
+        };
+
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(error.to_string().contains(
+            "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset"
+        ));
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_accepts_remote_endpoint_and_env_key() {
+        let _env_guard = env_override_lock().await;
+        let config = Config {
+            default_provider: Some("ollama".to_string()),
+            default_model: Some("glm-5:cloud".to_string()),
+            api_url: Some("https://ollama.com/api".to_string()),
+            api_key: None,
+            ..Config::default()
+        };
+
+        std::env::set_var("OLLAMA_API_KEY", "ollama-env-key");
+        let result = config.validate();
+        std::env::remove_var("OLLAMA_API_KEY");
+
+        assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
     async fn env_override_model_fallback() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -5206,6 +5406,42 @@ default_temperature = 0.7
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
         std::env::remove_var("ZEROCLAW_WORKSPACE");
+        let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn resolve_runtime_config_dirs_uses_env_config_dir_first() {
+        let _env_guard = env_override_lock().await;
+        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let default_workspace_dir = default_config_dir.join("workspace");
+        let explicit_config_dir = default_config_dir.join("explicit-config");
+        let marker_config_dir = default_config_dir.join("profiles").join("alpha");
+        let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
+
+        fs::create_dir_all(&default_config_dir).await.unwrap();
+        let state = ActiveWorkspaceState {
+            config_dir: marker_config_dir.to_string_lossy().into_owned(),
+        };
+        fs::write(&state_path, toml::to_string(&state).unwrap())
+            .await
+            .unwrap();
+
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
+        std::env::remove_var("ZEROCLAW_WORKSPACE");
+
+        let (config_dir, resolved_workspace_dir, source) =
+            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
+                .await
+                .unwrap();
+
+        assert_eq!(source, ConfigResolutionSource::EnvConfigDir);
+        assert_eq!(config_dir, explicit_config_dir);
+        assert_eq!(
+            resolved_workspace_dir,
+            explicit_config_dir.join("workspace")
+        );
+
+        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -5905,6 +6141,31 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_serde() {
+        let nc = NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: Some("webhook-secret".into()),
+            allowed_users: vec!["user_a".into(), "*".into()],
+        };
+
+        let json = serde_json::to_string(&nc).unwrap();
+        let parsed: NextcloudTalkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.base_url, "https://cloud.example.com");
+        assert_eq!(parsed.app_token, "app-token");
+        assert_eq!(parsed.webhook_secret.as_deref(), Some("webhook-secret"));
+        assert_eq!(parsed.allowed_users, vec!["user_a", "*"]);
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_defaults_optional_fields() {
+        let json = r#"{"base_url":"https://cloud.example.com","app_token":"app-token"}"#;
+        let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.webhook_secret.is_none());
+        assert!(parsed.allowed_users.is_empty());
     }
 
     // ── Config file permission hardening (Unix only) ───────────────

@@ -20,11 +20,13 @@ pub mod discord;
 pub mod email_channel;
 pub mod imessage;
 pub mod irc;
+#[cfg(feature = "channel-lark")]
 pub mod lark;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod nextcloud_talk;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -42,11 +44,13 @@ pub use discord::DiscordChannel;
 pub use email_channel::EmailChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
+#[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
 pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
+pub use nextcloud_talk::NextcloudTalkChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -68,7 +72,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -177,6 +181,11 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
+const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
+const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
+const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
@@ -694,13 +703,14 @@ async fn get_or_create_provider(
         None
     };
 
-    let provider = providers::create_resilient_provider_with_options(
+    let provider = create_resilient_provider_nonblocking(
         provider_name,
-        defaults.api_key.as_deref(),
-        api_url,
-        &defaults.reliability,
-        &ctx.provider_runtime_options,
-    )?;
+        ctx.api_key.clone(),
+        api_url.map(ToString::to_string),
+        ctx.reliability.as_ref().clone(),
+        ctx.provider_runtime_options.clone(),
+    )
+    .await?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
 
     if let Err(err) = provider.warmup().await {
@@ -712,6 +722,27 @@ async fn get_or_create_provider(
         .entry(provider_name.to_string())
         .or_insert_with(|| Arc::clone(&provider));
     Ok(Arc::clone(cached))
+}
+
+async fn create_resilient_provider_nonblocking(
+    provider_name: &str,
+    api_key: Option<String>,
+    api_url: Option<String>,
+    reliability: crate::config::ReliabilityConfig,
+    provider_runtime_options: providers::ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let provider_name = provider_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        providers::create_resilient_provider_with_options(
+            &provider_name,
+            api_key.as_deref(),
+            api_url.as_deref(),
+            &reliability,
+            &provider_runtime_options,
+        )
+    })
+    .await
+    .context("failed to join provider initialization task")?
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -991,6 +1022,170 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     }
 
     format!("[Used tools: {}]", tool_names.join(", "))
+}
+
+fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    let known_tool_names: HashSet<String> = tools
+        .iter()
+        .map(|tool| tool.name().to_ascii_lowercase())
+        .collect();
+    strip_isolated_tool_json_artifacts(response, &known_tool_names)
+}
+
+fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    let (name, has_args) =
+        if let Some(function) = object.get("function").and_then(|f| f.as_object()) {
+            (
+                function
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| object.get("name").and_then(|v| v.as_str())),
+                function.contains_key("arguments")
+                    || function.contains_key("parameters")
+                    || object.contains_key("arguments")
+                    || object.contains_key("parameters"),
+            )
+        } else {
+            (
+                object.get("name").and_then(|v| v.as_str()),
+                object.contains_key("arguments") || object.contains_key("parameters"),
+            )
+        };
+
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return false;
+    };
+
+    has_args && known_tool_names.contains(&name.to_ascii_lowercase())
+}
+
+fn is_tool_result_payload(
+    object: &serde_json::Map<String, serde_json::Value>,
+    saw_tool_call_payload: bool,
+) -> bool {
+    if !saw_tool_call_payload || !object.contains_key("result") {
+        return false;
+    }
+
+    object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "result" | "id" | "tool_call_id" | "name" | "tool"
+        )
+    })
+}
+
+fn sanitize_tool_json_value(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+    saw_tool_call_payload: bool,
+) -> Option<(String, bool)> {
+    if is_tool_call_payload(value, known_tool_names) {
+        return Some((String::new(), true));
+    }
+
+    if let Some(array) = value.as_array() {
+        if !array.is_empty()
+            && array
+                .iter()
+                .all(|item| is_tool_call_payload(item, known_tool_names))
+        {
+            return Some((String::new(), true));
+        }
+        return None;
+    }
+
+    let Some(object) = value.as_object() else {
+        return None;
+    };
+
+    if let Some(tool_calls) = object.get("tool_calls").and_then(|value| value.as_array()) {
+        if !tool_calls.is_empty()
+            && tool_calls
+                .iter()
+                .all(|call| is_tool_call_payload(call, known_tool_names))
+        {
+            let content = object
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return Some((content, true));
+        }
+    }
+
+    if is_tool_result_payload(object, saw_tool_call_payload) {
+        return Some((String::new(), false));
+    }
+
+    None
+}
+
+fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
+    let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = message[end..]
+        .find('\n')
+        .map_or(message.len(), |idx| end + idx);
+
+    message[line_start..start].trim().is_empty() && message[end..line_end].trim().is_empty()
+}
+
+fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<String>) -> String {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut cursor = 0usize;
+    let mut saw_tool_call_payload = false;
+
+    while cursor < message.len() {
+        let Some(rel_start) = message[cursor..].find(|ch: char| ch == '{' || ch == '[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+
+        let candidate = &message[start..];
+        let mut stream =
+            serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                let end = start + consumed;
+                if is_line_isolated_json_segment(message, start, end) {
+                    if let Some((replacement, marks_tool_call)) =
+                        sanitize_tool_json_value(&value, known_tool_names, saw_tool_call_payload)
+                    {
+                        if marks_tool_call {
+                            saw_tool_call_payload = true;
+                        }
+                        if !replacement.trim().is_empty() {
+                            cleaned.push_str(replacement.trim());
+                        }
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let Some(ch) = message[start..].chars().next() else {
+            break;
+        };
+        cleaned.push(ch);
+        cursor = start + ch.len_utf8();
+    }
+
+    let mut result = cleaned.replace("\r\n", "\n");
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    result.trim().to_string()
 }
 
 fn spawn_supervised_listener(
@@ -1337,14 +1532,23 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            let sanitized_response =
+                sanitize_channel_response(&response, ctx.tools_registry.as_ref());
+            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
+            {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+            } else {
+                sanitized_response
+            };
+
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
             let history_response = if tool_summary.is_empty() {
-                response.clone()
+                delivered_response.clone()
             } else {
-                format!("{tool_summary}\n{response}")
+                format!("{tool_summary}\n{delivered_response}")
             };
 
             append_sender_turn(
@@ -1355,25 +1559,25 @@ async fn process_channel_message(
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&response, 80)
+                truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &response)
+                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(&response, &msg.reply_target)
+                                &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(response, &msg.reply_target)
+                        &SendMessage::new(delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -1616,6 +1820,7 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
+        crate::config::SkillsPromptInjectionMode::Full,
     )
 }
 
@@ -1627,6 +1832,7 @@ pub fn build_system_prompt_with_mode(
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -1689,9 +1895,13 @@ pub fn build_system_prompt_with_mode(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (full instructions + tool metadata) ───────────
+    // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt(skills, workspace_dir));
+        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
+            skills,
+            workspace_dir,
+            skills_prompt_mode,
+        ));
         prompt.push_str("\n\n");
     }
 
@@ -1911,6 +2121,27 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     }
 
     if cfg!(target_os = "linux") {
+        // OpenRC (system-wide) takes precedence over systemd (user-level)
+        let openrc_init_script = PathBuf::from("/etc/init.d/zeroclaw");
+        if openrc_init_script.exists() {
+            if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output()
+            {
+                // rc-service exits 0 if running, non-zero otherwise
+                if status_output.status.success() {
+                    let restart_output = Command::new("rc-service")
+                        .args(OPENRC_RESTART_ARGS)
+                        .output()
+                        .context("Failed to restart OpenRC daemon service")?;
+                    if !restart_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&restart_output.stderr);
+                        anyhow::bail!("rc-service restart failed: {}", stderr.trim());
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Systemd (user-level)
         let home = directories::UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
             .context("Could not find home directory")?;
@@ -1924,7 +2155,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         }
 
         let active_output = Command::new("systemctl")
-            .args(["--user", "is-active", "zeroclaw.service"])
+            .args(SYSTEMD_STATUS_ARGS)
             .output()
             .context("Failed to query systemd service state")?;
         let state = String::from_utf8_lossy(&active_output.stdout);
@@ -1933,7 +2164,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
         }
 
         let restart_output = Command::new("systemctl")
-            .args(["--user", "restart", "zeroclaw.service"])
+            .args(SYSTEMD_RESTART_ARGS)
             .output()
             .context("Failed to restart systemd daemon service")?;
         if !restart_output.status.success() {
@@ -1972,9 +2203,16 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ("Signal", config.channels_config.signal.is_some()),
                 ("WhatsApp", config.channels_config.whatsapp.is_some()),
                 ("Linq", config.channels_config.linq.is_some()),
+                (
+                    "Nextcloud Talk",
+                    config.channels_config.nextcloud_talk.is_some(),
+                ),
                 ("Email", config.channels_config.email.is_some()),
                 ("IRC", config.channels_config.irc.is_some()),
-                ("Lark", config.channels_config.lark.is_some()),
+                (
+                    "Lark",
+                    cfg!(feature = "channel-lark") && config.channels_config.lark.is_some(),
+                ),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
             ] {
@@ -1983,6 +2221,11 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             if !cfg!(feature = "channel-matrix") {
                 println!(
                     "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
+                );
+            }
+            if !cfg!(feature = "channel-lark") {
+                println!(
+                    "  ℹ️ Lark channel support is disabled in this build (enable `channel-lark`)."
                 );
             }
             println!("\nTo start channels: zeroclaw channel start");
@@ -2171,6 +2414,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if let Some(ref nc) = config.channels_config.nextcloud_talk {
+        channels.push((
+            "Nextcloud Talk",
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
+            )),
+        ));
+    }
+
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(("Email", Arc::new(EmailChannel::new(email_cfg.clone()))));
     }
@@ -2193,8 +2447,16 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
         channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
+    }
+
+    #[cfg(not(feature = "channel-lark"))]
+    if config.channels_config.lark.is_some() {
+        tracing::warn!(
+            "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark health check."
+        );
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -2270,13 +2532,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        &provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &provider_runtime_options,
-    )?);
+    let provider: Arc<dyn Provider> = Arc::from(
+        create_resilient_provider_nonblocking(
+            &provider_name,
+            config.api_key.clone(),
+            config.api_url.clone(),
+            config.reliability.clone(),
+            provider_runtime_options.clone(),
+        )
+        .await?,
+    );
 
     // Warm up the provider connection pool (TLS handshake, DNS, HTTP/2 setup)
     // so the first real message doesn't hit a cold-start timeout.
@@ -2410,6 +2675,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.identity),
         bootstrap_max_chars,
         native_tools,
+        config.skills.prompt_injection_mode,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
@@ -2556,6 +2822,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         )));
     }
 
+    if let Some(ref nc) = config.channels_config.nextcloud_talk {
+        channels.push(Arc::new(NextcloudTalkChannel::new(
+            nc.base_url.clone(),
+            nc.app_token.clone(),
+            nc.allowed_users.clone(),
+        )));
+    }
+
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
     }
@@ -2575,8 +2849,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         })));
     }
 
+    #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
         channels.push(Arc::new(LarkChannel::from_config(lk)));
+    }
+
+    #[cfg(not(feature = "channel-lark"))]
+    if config.channels_config.lark.is_some() {
+        tracing::warn!(
+            "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark runtime startup."
+        );
     }
 
     if let Some(ref dt) = config.channels_config.dingtalk {
@@ -2712,7 +2994,7 @@ mod tests {
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -3071,6 +3353,33 @@ mod tests {
         }
     }
 
+    struct RawToolArtifactProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for RawToolArtifactProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(r#"{"name":"mock_price","parameters":{"symbol":"BTC"}}
+{"result":{"symbol":"BTC","price_usd":65000}}
+BTC is currently around $65,000 based on latest tool output."#
+                .to_string())
+        }
+    }
+
     struct IterativeToolProvider {
         required_tool_iterations: usize,
     }
@@ -3311,6 +3620,63 @@ mod tests {
         assert!(sent_messages[0].contains("BTC is currently around"));
         assert!(!sent_messages[0].contains("\"tool_calls\""));
         assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(RawToolArtifactProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-raw-json".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-raw".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 3,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("chat-raw:"));
+        assert!(sent_messages[0].contains("BTC is currently around"));
+        assert!(!sent_messages[0].contains("\"name\":\"mock_price\""));
+        assert!(!sent_messages[0].contains("\"result\""));
     }
 
     #[tokio::test]
@@ -4403,6 +4769,47 @@ mod tests {
     }
 
     #[test]
+    fn prompt_skills_compact_mode_omits_instructions_and_tools() {
+        let ws = make_workspace();
+        let skills = vec![crate::skills::Skill {
+            name: "code-review".into(),
+            description: "Review code for bugs".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "lint".into(),
+                description: "Run static checks".into(),
+                kind: "shell".into(),
+                command: "cargo clippy".into(),
+                args: HashMap::new(),
+            }],
+            prompts: vec!["Always run cargo test before final response.".into()],
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "model",
+            &[],
+            &skills,
+            None,
+            None,
+            false,
+            crate::config::SkillsPromptInjectionMode::Compact,
+        );
+
+        assert!(prompt.contains("<available_skills>"), "missing skills XML");
+        assert!(prompt.contains("<name>code-review</name>"));
+        assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
+        assert!(prompt.contains("loaded on demand"));
+        assert!(!prompt.contains("<instructions>"));
+        assert!(!prompt
+            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(!prompt.contains("<tools>"));
+    }
+
+    #[test]
     fn prompt_skills_escape_reserved_xml_chars() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
@@ -4909,6 +5316,42 @@ Mon Feb 20
         assert_eq!(summary, "[Used tools: fresh_tool]");
     }
 
+    #[test]
+    fn strip_isolated_tool_json_artifacts_removes_tool_calls_and_results() {
+        let mut known_tools = HashSet::new();
+        known_tools.insert("schedule".to_string());
+
+        let input = r#"{"name":"schedule","parameters":{"action":"create","message":"test"}}
+{"name":"schedule","parameters":{"action":"cancel","task_id":"test"}}
+Let me create the reminder properly:
+{"name":"schedule","parameters":{"action":"create","message":"Go to sleep"}}
+{"result":{"task_id":"abc","status":"scheduled"}}
+Done reminder set for 1:38 AM."#;
+
+        let result = strip_isolated_tool_json_artifacts(input, &known_tools);
+        let normalized = result
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            normalized,
+            "Let me create the reminder properly:\nDone reminder set for 1:38 AM."
+        );
+    }
+
+    #[test]
+    fn strip_isolated_tool_json_artifacts_preserves_non_tool_json() {
+        let mut known_tools = HashSet::new();
+        known_tools.insert("shell".to_string());
+
+        let input = r#"{"name":"profile","parameters":{"timezone":"UTC"}}
+This is an example JSON object for profile settings."#;
+
+        let result = strip_isolated_tool_json_artifacts(input, &known_tools);
+        assert_eq!(result, input);
+    }
+
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────
 
     #[test]
@@ -5200,5 +5643,23 @@ Mon Feb 20
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn maybe_restart_daemon_systemd_args_regression() {
+        assert_eq!(
+            SYSTEMD_STATUS_ARGS,
+            ["--user", "is-active", "zeroclaw.service"]
+        );
+        assert_eq!(
+            SYSTEMD_RESTART_ARGS,
+            ["--user", "restart", "zeroclaw.service"]
+        );
+    }
+
+    #[test]
+    fn maybe_restart_daemon_openrc_args_regression() {
+        assert_eq!(OPENRC_STATUS_ARGS, ["zeroclaw", "status"]);
+        assert_eq!(OPENRC_RESTART_ARGS, ["zeroclaw", "restart"]);
     }
 }

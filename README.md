@@ -25,7 +25,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.vi.md">Tiếng Việt</a>
+  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
 </p>
 
 <p align="center">
@@ -85,7 +85,7 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
 | **Language** | TypeScript | Python | Go | **Rust** |
 | **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
 | **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
-| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **3.4 MB** |
+| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **~8.8 MB** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
 
 > Notes: ZeroClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and ZeroClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
@@ -231,8 +231,14 @@ cd zeroclaw
 # Optional: run onboarding in the same flow
 ./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
 
-# Optional: run bootstrap + onboarding fully in Docker
+# Optional: run bootstrap + onboarding fully in Docker-compatible mode
 ./bootstrap.sh --docker
+
+# Optional: force Podman as container CLI
+ZEROCLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker
+
+# Optional: in --docker mode, skip local image build and use local tag or pull fallback image
+./bootstrap.sh --docker --skip-build
 ```
 
 Remote one-liner (review first in security-sensitive environments):
@@ -277,6 +283,9 @@ zeroclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/aut
 # Or interactive wizard
 zeroclaw onboard --interactive
 
+# If config.toml already exists and you intentionally want to overwrite it
+zeroclaw onboard --force
+
 # Or quickly repair channels/allowlists only
 zeroclaw onboard --channels-only
 
@@ -320,6 +329,8 @@ zeroclaw integrations info Telegram
 zeroclaw service install
 zeroclaw service status
 zeroclaw service restart
+
+# On Alpine (OpenRC): sudo zeroclaw service install
 
 # Migrate memory from OpenClaw (safe preview first)
 zeroclaw migrate openclaw --dry-run
@@ -896,7 +907,7 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 | `agent` | Interactive or single-message chat mode |
 | `gateway` | Start webhook server (default: `127.0.0.1:3000`) |
 | `daemon` | Start long-running autonomous runtime |
-| `service` | Manage user-level background service |
+| `service install/start/stop/status/uninstall` | Manage background service (systemd user-level or OpenRC system-wide) |
 | `doctor` | Diagnose daemon/scheduler/channel freshness |
 | `status` | Show full system status |
 | `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
@@ -912,6 +923,30 @@ See [aieos.org](https://aieos.org) for the full schema and live examples.
 
 For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
 
+### Service Management
+
+ZeroClaw supports two init systems for background services:
+
+| Init System | Scope | Config Path | Requires |
+|------------|-------|-------------|----------|
+| **systemd** (default on Linux) | User-level | `~/.zeroclaw/config.toml` | No sudo |
+| **OpenRC** (Alpine) | System-wide | `/etc/zeroclaw/config.toml` | sudo/root |
+
+Init system is auto-detected (`systemd` or `OpenRC`).
+
+```bash
+# Linux with systemd (default, user-level)
+zeroclaw service install
+zeroclaw service start
+
+# Alpine with OpenRC (system-wide, requires sudo)
+sudo zeroclaw service install
+sudo rc-update add zeroclaw default
+sudo rc-service zeroclaw start
+```
+
+For full OpenRC setup instructions, see [docs/network-deployment.md](docs/network-deployment.md#7-openrc-alpine-linux-service).
+
 ### Open-Skills Opt-In
 
 Community `open-skills` sync is disabled by default. Enable it explicitly in `config.toml`:
@@ -920,9 +955,10 @@ Community `open-skills` sync is disabled by default. Enable it explicitly in `co
 [skills]
 open_skills_enabled = true
 # open_skills_dir = "/path/to/open-skills"  # optional
+# prompt_injection_mode = "compact"          # optional: use for low-context local models
 ```
 
-You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED` and `ZEROCLAW_OPEN_SKILLS_DIR`.
+You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED`, `ZEROCLAW_OPEN_SKILLS_DIR`, and `ZEROCLAW_SKILLS_PROMPT_MODE` (`full` or `compact`).
 
 ## Development
 
