@@ -17,6 +17,7 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     let migration_result = conn
         .interact(|conn| conn.run_pending_migrations(MIGRATIONS).map(|_| ()))
         .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     migration_result.map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
