@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::rag::pgvector::PgVectorRagStore;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -12,6 +13,7 @@ pub struct HttpRequestTool {
     allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    rag_store: Option<Arc<PgVectorRagStore>>,
 }
 
 impl HttpRequestTool {
@@ -20,12 +22,14 @@ impl HttpRequestTool {
         allowed_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        rag_store: Option<Arc<PgVectorRagStore>>,
     ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
+            rag_store,
         }
     }
 
@@ -264,6 +268,14 @@ impl Tool for HttpRequestTool {
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
+                if status.is_success() {
+                    if let Some(rag_store) = &self.rag_store {
+                        if let Err(e) = rag_store.ingest_web_content(&url, &response_text).await {
+                            tracing::debug!("RAG ingest skipped for url {}: {}", url, e);
+                        }
+                    }
+                }
+
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -449,6 +461,7 @@ mod tests {
             allowed_domains.into_iter().map(String::from).collect(),
             1_000_000,
             30,
+            None,
         )
     }
 
@@ -694,6 +707,7 @@ mod tests {
             vec!["example.com".into()],
             10,
             30,
+            None,
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);

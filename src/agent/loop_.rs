@@ -1442,6 +1442,19 @@ pub async fn run(
     ));
 
     // ── Memory (the brain) ────────────────────────────────────────
+    if config.rag.enabled {
+        let db_url = config
+            .storage
+            .provider
+            .config
+            .db_url
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("rag.enabled=true requires storage.provider.config.db_url")
+            })?;
+        crate::rag::ensure_rag_schema(config.rag.enabled, db_url).await?;
+    }
+
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
         Some(&config.storage.provider.config),

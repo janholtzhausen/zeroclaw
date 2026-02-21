@@ -243,11 +243,40 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
+        let rag_store = if config.rag.enabled {
+            let db_url = config.storage.provider.config.db_url.as_deref();
+            let rag_key = config.rag.embedding_api_key.as_deref();
+            match (db_url, rag_key) {
+                (Some(db_url), Some(api_key)) if !api_key.trim().is_empty() => {
+                    match crate::rag::pgvector::PgVectorRagStore::new_without_migrations(
+                        db_url,
+                        api_key,
+                        &config.rag.embedding_base_url,
+                        &config.rag.embedding_model,
+                        config.rag.similarity_threshold,
+                    ) {
+                        Ok(store) => Some(Arc::new(store)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to initialize RAG store for http_request tool: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
+            rag_store,
         )));
     }
 

@@ -131,6 +131,10 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
 
+    /// Retrieval-augmented generation configuration (`[rag]`).
+    #[serde(default)]
+    pub rag: RagConfig,
+
     /// Tunnel configuration for exposing the gateway publicly (`[tunnel]`).
     #[serde(default)]
     pub tunnel: TunnelConfig,
@@ -1519,6 +1523,77 @@ impl Default for StorageProviderConfig {
     }
 }
 
+/// RAG configuration (`[rag]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RagConfig {
+    #[serde(default = "default_rag_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_rag_embedding_provider")]
+    pub embedding_provider: String,
+    #[serde(default = "default_rag_embedding_model")]
+    pub embedding_model: String,
+    #[serde(default)]
+    pub embedding_api_key: Option<String>,
+    #[serde(default = "default_rag_embedding_base_url")]
+    pub embedding_base_url: String,
+    #[serde(default = "default_rag_chunk_size_tokens")]
+    pub chunk_size_tokens: usize,
+    #[serde(default = "default_rag_chunk_overlap_tokens")]
+    pub chunk_overlap_tokens: usize,
+    #[serde(default = "default_rag_retrieval_top_k")]
+    pub retrieval_top_k: usize,
+    #[serde(default = "default_rag_similarity_threshold")]
+    pub similarity_threshold: f32,
+}
+
+fn default_rag_enabled() -> bool {
+    true
+}
+
+fn default_rag_embedding_provider() -> String {
+    "nvidia".to_string()
+}
+
+fn default_rag_embedding_model() -> String {
+    "nvidia/nv-embedqa-e5-v5".to_string()
+}
+
+fn default_rag_embedding_base_url() -> String {
+    "https://integrate.api.nvidia.com/v1".to_string()
+}
+
+fn default_rag_chunk_size_tokens() -> usize {
+    500
+}
+
+fn default_rag_chunk_overlap_tokens() -> usize {
+    50
+}
+
+fn default_rag_retrieval_top_k() -> usize {
+    5
+}
+
+fn default_rag_similarity_threshold() -> f32 {
+    0.3
+}
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rag_enabled(),
+            embedding_provider: default_rag_embedding_provider(),
+            embedding_model: default_rag_embedding_model(),
+            embedding_api_key: None,
+            embedding_base_url: default_rag_embedding_base_url(),
+            chunk_size_tokens: default_rag_chunk_size_tokens(),
+            chunk_overlap_tokens: default_rag_chunk_overlap_tokens(),
+            retrieval_top_k: default_rag_retrieval_top_k(),
+            similarity_threshold: default_rag_similarity_threshold(),
+        }
+    }
+}
+
 /// Memory backend configuration (`[memory]` section).
 ///
 /// Controls conversation memory storage, embeddings, hybrid search, response caching,
@@ -2834,6 +2909,7 @@ impl Default for Config {
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
+            rag: RagConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -3320,6 +3396,16 @@ impl Config {
                     "default_model uses ':cloud' with provider 'ollama', but no API key is configured. Set api_key or OLLAMA_API_KEY."
                 );
             }
+        }
+
+        if self.rag.enabled
+            && self
+                .rag
+                .embedding_api_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            anyhow::bail!("rag.enabled=true requires rag.embedding_api_key");
         }
 
         // Proxy (delegate to existing validation)
@@ -3985,6 +4071,7 @@ default_temperature = 0.7
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
+            rag: RagConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
@@ -4154,6 +4241,7 @@ tool_dispatcher = "xml"
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
+            rag: RagConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
